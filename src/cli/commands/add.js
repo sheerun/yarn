@@ -91,6 +91,7 @@ export class Add extends Install {
 
   bailout(
     patterns: Array<string>,
+    match: IntegrityMatch,
   ): Promise<boolean> {
     return Promise.resolve(false);
   }

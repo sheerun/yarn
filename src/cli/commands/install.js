@@ -240,8 +240,8 @@ export class Install {
 
   async bailout(
     patterns: Array<string>,
+    match: IntegrityMatch,
   ): Promise<boolean> {
-    const match = await this.matchesIntegrityHash(patterns);
     if (!this.flags.skipIntegrity && !this.flags.force && match.matches) {
       this.reporter.success(this.reporter.lang('upToDate'));
       return true;
@@ -285,12 +285,15 @@ export class Install {
     let patterns: Array<string> = [];
     const steps: Array<(curr: number, total: number) => Promise<{bailout: boolean} | void>> = [];
     const [depRequests, rawPatterns] = await this.fetchRequestFromCwd();
+    let currentIntegrityHash: string = '';
 
     steps.push(async (curr: number, total: number) => {
       this.reporter.step(curr, total, this.reporter.lang('resolvingPackages'), emoji.get('mag'));
       await this.resolver.init(this.prepareRequests(depRequests), this.flags.flat);
       patterns = await this.flatten(this.preparePatterns(rawPatterns));
-      return {bailout: await this.bailout(patterns)};
+      const match = await this.matchesIntegrityHash(patterns);
+      currentIntegrityHash = match.actual;
+      return {bailout: await this.bailout(patterns, match)};
     });
 
 
@@ -353,7 +356,7 @@ export class Install {
     }
 
     // fin!
-    await this.saveLockfileAndIntegrity(patterns);
+    await this.saveLockfileAndIntegrity(patterns, currentIntegrityHash);
     this.config.requestManager.clearCache();
     return patterns;
   }
@@ -463,42 +466,23 @@ export class Install {
    * Save updated integrity and lockfiles.
    */
 
-  async saveLockfileAndIntegrity(patterns: Array<string>): Promise<void> {
-    // stringify current lockfile
-    const lockSource = lockStringify(this.lockfile.getLockfile(this.resolver.patterns));
+  async saveLockfileAndIntegrity(patterns: Array<string>, currentIntegrityHash: string): Promise<void> {
 
-    // write integrity hash
-    await this.writeIntegrityHash(lockSource, patterns);
+    const loc = await this.getIntegrityHashLocation();
+    const lockSource = lockStringify(this.lockfile.getLockfile(this.resolver.patterns));
+    const actual = this.generateIntegrityHash(lockSource, patterns);
+
+    if (actual !== currentIntegrityHash) {
+      // write integrity hash
+      invariant(loc, 'expected integrity hash location');
+      await fs.writeFile(loc, actual);
+    }
 
     // --no-lockfile or --pure-lockfile flag
-    if (this.flags.lockfile === false || this.flags.pureLockfile) {
+    if (actual === currentIntegrityHash || this.flags.lockfile === false || this.flags.pureLockfile) {
       return;
     }
 
-    // check if the loaded lockfile has all the included patterns
-    let inSync = true;
-    for (const pattern of patterns) {
-      if (!this.lockfile.getLocked(pattern)) {
-        inSync = false;
-        break;
-      }
-    }
-    // check if loaded lockfile has patterns we don't have, eg. uninstall
-    for (const pattern in this.lockfile.cache) {
-      if (patterns.indexOf(pattern) === -1) {
-        inSync = false;
-        break;
-      }
-    }
-    // don't write new lockfile if in sync
-    if (inSync) {
-      return;
-    }
-
-    // build lockfile location
-    const loc = path.join(this.config.cwd, constants.LOCKFILE_FILENAME);
-
-    // write lockfile
     await fs.writeFile(loc, lockSource);
 
     this._logSuccessSaveLockfile();
@@ -514,17 +498,17 @@ export class Install {
 
   async matchesIntegrityHash(patterns: Array<string>): Promise<IntegrityMatch> {
     const loc = await this.getIntegrityHashLocation();
+    const lockSource = lockStringify(this.lockfile.getLockfile(this.resolver.patterns));
+    const actual = this.generateIntegrityHash(lockSource, patterns);
     if (!await fs.exists(loc)) {
       return {
-        actual: '',
+        actual,
         expected: '',
         loc,
         matches: false,
       };
     }
 
-    const lockSource = lockStringify(this.lockfile.getLockfile(this.resolver.patterns));
-    const actual = this.generateIntegrityHash(lockSource, patterns);
     const expected = (await fs.readFile(loc)).trim();
 
     return {
@@ -571,15 +555,6 @@ export class Install {
       }
     }
     return loc;
-  }
-  /**
-   * Write the integrity hash of the current install to disk.
-   */
-
-  async writeIntegrityHash(lockSource: string, patterns: Array<string>): Promise<void> {
-    const loc = await this.getIntegrityHashLocation();
-    invariant(loc, 'expected integrity hash location');
-    await fs.writeFile(loc, this.generateIntegrityHash(lockSource, patterns));
   }
 
   /**
